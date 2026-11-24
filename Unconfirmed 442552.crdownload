@@ -1,0 +1,152 @@
+"""
+University FAQ Chatbot - RAG (Retrieval-Augmented Generation)
+
+Pipeline:
+  1. Load   : read the FAQ knowledge base (markdown) and split into chunks
+  2. Index  : convert every chunk into a TF-IDF vector (word + bigram)
+  3. Retrieve: embed the user question, rank chunks by cosine similarity
+  4. Generate: build a grounded answer from the top chunks
+               (extractive by default; optional LLM generation if an
+               ANTHROPIC_API_KEY is set)
+"""
+import os
+import re
+import sys
+from dataclasses import dataclass
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "university_faq.md")
+TOP_K = 3
+MIN_SCORE = 0.12  # below this the bot says "I don't know" instead of guessing
+
+
+@dataclass
+class Chunk:
+    category: str
+    question: str
+    answer: str
+
+    @property
+    def text(self) -> str:
+        return f"{self.category}. {self.question} {self.answer}"
+
+
+# ---------------------------------------------------------------- 1. LOAD
+def load_chunks(path: str = DATA_FILE) -> list[Chunk]:
+    """Each Q/A pair in the markdown file becomes one chunk."""
+    chunks, category, q = [], "General", None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("## "):
+                category = line[3:].strip()
+            elif line.startswith("Q:"):
+                q = line[2:].strip()
+            elif line.startswith("A:") and q:
+                chunks.append(Chunk(category, q, line[2:].strip()))
+                q = None
+    return chunks
+
+
+# ---------------------------------------------------- 2. INDEX + 3. RETRIEVE
+class Retriever:
+    def __init__(self, chunks: list[Chunk]):
+        self.chunks = chunks
+        self.vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2),
+            sublinear_tf=True,
+        )
+        self.matrix = self.vectorizer.fit_transform(c.text for c in chunks)
+
+    def search(self, query: str, k: int = TOP_K):
+        q_vec = self.vectorizer.transform([query])
+        scores = cosine_similarity(q_vec, self.matrix).ravel()
+        top = np.argsort(scores)[::-1][:k]
+        return [(self.chunks[i], float(scores[i])) for i in top]
+
+
+# ------------------------------------------------------------ 4. GENERATE
+def extractive_answer(hits) -> str:
+    """Offline generator: return the answer of the best chunk (grounded)."""
+    best, _ = hits[0]
+    return best.answer
+
+
+def llm_answer(question: str, hits) -> str | None:
+    """Optional: let Claude rewrite the answer using ONLY the retrieved context."""
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    try:
+        import anthropic
+
+        context = "\n\n".join(f"[{c.category}] Q: {c.question}\nA: {c.answer}" for c, _ in hits)
+        client = anthropic.Anthropic(api_key=key)
+        msg = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            system=(
+                "You are a university help-desk assistant. Answer ONLY from the "
+                "context given. If the context does not contain the answer, say "
+                "you don't know and suggest contacting the help desk."
+            ),
+            messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
+        )
+        return msg.content[0].text
+    except Exception:
+        return None  # fall back to extractive answer
+
+
+class FAQBot:
+    def __init__(self):
+        self.retriever = Retriever(load_chunks())
+
+    def ask(self, question: str):
+        hits = self.retriever.search(question)
+        if hits[0][1] < MIN_SCORE:
+            return (
+                "Sorry, I couldn't find that in the university FAQ. "
+                "Please contact the help desk: helpdesk@sampleuniversity.edu.in",
+                hits,
+            )
+        return (llm_answer(question, hits) or extractive_answer(hits)), hits
+
+
+# -------------------------------------------------------------------- CLI
+def show(question: str, bot: FAQBot):
+    answer, hits = bot.ask(question)
+    print(f"\nYou : {question}")
+    print(f"Bot : {answer}")
+    print("      Sources:")
+    for chunk, score in hits:
+        print(f"        - [{chunk.category}] {chunk.question}  (score {score:.2f})")
+
+
+def main():
+    bot = FAQBot()
+    print(f"University FAQ Chatbot (RAG) - {len(bot.retriever.chunks)} FAQ chunks indexed")
+    print("Type 'exit' to quit.")
+    if len(sys.argv) > 1:  # non-interactive: python chatbot.py "question"
+        show(" ".join(sys.argv[1:]), bot)
+        return
+    while True:
+        try:
+            q = input("\nYou : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if q.lower() in {"exit", "quit", "q"}:
+            break
+        if q:
+            answer, hits = bot.ask(q)
+            print(f"Bot : {answer}")
+            print("      Sources: " + "; ".join(f"{c.question} ({s:.2f})" for c, s in hits))
+    print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
